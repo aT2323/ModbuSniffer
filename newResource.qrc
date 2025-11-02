@@ -1,0 +1,5 @@
+<RCC>
+  <qresource prefix="newPrefix">
+    <file>../../../../Desktop/Работа/ОБОРУДОВАНИЕ/HMI/ICON/_FINAL (2)/SE_MAIN_ICONS/eco_green/PNG/SE_MAIN_ICONS_A002.png</file>
+  </qresource>
+</RCC>

@@ -49,7 +49,7 @@ def read_from_com(ser: serial, message_queue, enClear=False):
                 if buffer:
                     message_hex = buffer.hex()
                     message_queue.put(message_hex)
-                    print(time_diff)                  # для отладки
+ #                   print(time_diff)                  # для отладки
                     print(message_hex)                # для отладки
                     buffer.clear()  # Очищаем буфер
 
@@ -63,7 +63,7 @@ def read_from_com(ser: serial, message_queue, enClear=False):
 if __name__ == '__main__':
     try:
         list_ports = read_list_ports()
-        ser = open_serial_port('COM23',19200,8,'N')
+        ser = open_serial_port('COM15',19200,8,'E')
         message_queue = queue.Queue()
         while True:
             read_from_com(ser, message_queue)
