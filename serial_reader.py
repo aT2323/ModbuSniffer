@@ -53,16 +53,18 @@ def read_from_com(ser: serial.Serial, message_queue, enClear=False):
                 last_time = current_time
 
                 # Если пауза больше 3.5 символов (полное сообщение), выводим его
-                if time_diff >= timeout_check:  # при разрыве сообщение обычно пауза доходит до +- 8 символов. А настоящая пауза длится от 30 символов, но общение 1 в 1
+                if time_diff >= timeout_check:
                     if buffer:
                         message_hex = buffer.hex()
-                        message_queue.put(message_hex)
-                        
+                        try:
+                            message_queue.put_nowait(message_hex)  # Неблокирующая вставка
+                        except queue.Full:
+                            # Если очередь переполнена - пропускаем старое сообщение
+                            pass
                         buffer.clear()  # Очищаем буфер
 
                 # Если активирован разборчивый режим и пауза больше 1.5 символа, но меньше 3.5 символов
                 elif enClear and time_diff > 1.5 * symbol_time:
-                    # print(time_diff/symbol_time)
                     buffer.clear()  # Очищаем буфер
 
                 buffer.extend(byte)  # Добавляем байт в буфер
@@ -74,7 +76,11 @@ def read_from_com(ser: serial.Serial, message_queue, enClear=False):
                     time_diff = current_time - last_time
                     if time_diff >= timeout_check:
                         message_hex = buffer.hex()
-                        message_queue.put(message_hex)
+                        try:
+                            message_queue.put_nowait(message_hex)  # Неблокирующая вставка
+                        except queue.Full:
+                            # Если очередь переполнена - пропускаем старое сообщение
+                            pass
                         buffer.clear()
                 time.sleep(0.01)  # Небольшая задержка, чтобы не нагружать CPU
                 
@@ -85,7 +91,10 @@ def read_from_com(ser: serial.Serial, message_queue, enClear=False):
         # Отправляем последнее сообщение из буфера, если оно есть
         if buffer:
             message_hex = buffer.hex()
-            message_queue.put(message_hex)
+            try:
+                message_queue.put_nowait(message_hex)  # Неблокирующая вставка
+            except queue.Full:
+                pass
 
 if __name__ == '__main__':
     try:

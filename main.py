@@ -6,11 +6,18 @@ from serial_reader import read_list_ports, open_serial_port, read_from_com
 
 from PyQt6.QtWidgets import QApplication, QMainWindow, QTableWidget, QTableWidgetItem, QMessageBox, QHeaderView, QComboBox, QAbstractItemView
 from PyQt6.QtGui import QColor
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtCore import QTimer, Qt, pyqtSignal, QObject
 import struct
 from designe import Ui_MainWindow  
 from decode import Frame
 import serial
+
+
+class ScanSignals(QObject):
+    """Сигналы для обновления UI из потока сканирования"""
+    status_update = pyqtSignal(str)
+    button_update = pyqtSignal(str)
+    scan_finished = pyqtSignal(bool, str, str, str, str)  # success, baudrate, bytesize, parity, stopbit
 
 
 class MainWindow(QMainWindow, Ui_MainWindow):
@@ -21,13 +28,16 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # Инициализация переменных
         self.serial_port = None
         self.read_thread = None
-        self.message_queue = queue.Queue()
+        self.message_queue = queue.Queue(maxsize=0)  # Очередь для сырых hex строк из COM порта (неограниченная)
+        self.decoded_queue = queue.Queue(maxsize=0)  # Очередь для декодированных сообщений (frame, message_bytes) (неограниченная)
+        self.decode_thread = None
         self.is_connected = False
         self.message_counter = 0
         # Индексы для обновления строк
         self.request_index_by_bytes = {}
         self.response_index_by_signature = {}
-        self.last_request_time_by_af = {}
+        self.last_request_time_by_af = {}  # Время последнего запроса по (address, function)
+        self.last_request_time_by_key = {}  # Время последнего запроса по req_key (для функций 5 и 6)
         self.last_request_row_by_af = {}
         self.skip_first_invalid_crc = False
         self.connected_at = None
@@ -45,6 +55,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # Флаг начала вывода: True = ждем первого запроса, False = выводим все сообщения
         self.waiting_for_first_request = True
         
+        # Отслеживание сообщений функций 5 и 6 для определения запрос/ответ
+        # Ключ = (address, function, data_bytes), значение = количество раз
+        self.write_single_message_count = {}
+        
         # Заполняем comboBox_COM при запуске
         self.populate_com_ports()
         # Значение по умолчанию: Биты данных = 8
@@ -56,10 +70,31 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # Подключаем кнопку Подключить к функции подключения к COM-порту
         self.pushButton_connect.clicked.connect(self.on_connect_clicked)
         
-        # Таймер для обработки очереди сообщений
+        # Подключаем кнопку сканирования сети
+        self.pushButton_scan.clicked.connect(self.on_scan_clicked)
+        
+        # Флаг для остановки сканирования
+        self.scanning_active = False
+        self.scan_thread = None
+        self.current_test_port = None  # Текущий тестовый порт для возможности закрытия при остановке
+        self.scan_successful = False  # Флаг успешного сканирования
+        # Сигналы для обновления UI из потока сканирования
+        self.scan_signals = ScanSignals()
+        self.scan_signals.status_update.connect(self.update_scan_status_label)
+        self.scan_signals.button_update.connect(self.update_scan_button)
+        self.scan_signals.scan_finished.connect(self.on_scan_finished)
+        
+        # Таймер для обработки очереди декодированных сообщений
         self.timer = QTimer()
-        self.timer.timeout.connect(self.process_messages)
-        self.timer.start(100)  # Проверка каждые 100 мс
+        self.timer.timeout.connect(self.process_decoded_messages)
+        self.timer.start(50)  # Проверка каждые 50 мс для более быстрой обработки
+        
+        # Запускаем поток декодирования сразу при старте (будет ждать подключения)
+        self.decode_thread = threading.Thread(
+            target=self.decode_messages,
+            daemon=True
+        )
+        self.decode_thread.start()
         
         # Таймер для обработки ожидающих ответов (проверка каждые 500 мс)
         self.process_pending_timer = QTimer()
@@ -69,9 +104,18 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # Подключаем фильтры
         self.checkBox_filter_crc_ok.stateChanged.connect(self.apply_filters)
         self.checkBox_filter_errors_only.stateChanged.connect(self.apply_filters)
+        self.comboBox_filter_address.currentTextChanged.connect(self.apply_filters)
+        self.comboBox_filter_function.currentTextChanged.connect(self.apply_filters)
+        
+        # Инициализируем списки для фильтров адреса и функции
+        self.comboBox_filter_address.addItem("")
+        self.comboBox_filter_function.addItem("")
         
         # Подключаем кнопку очистки
         self.pushButton_clear.clicked.connect(self.clear_table)
+        
+        # Подключаем кнопку сброса фильтров
+        self.pushButton_reset_filters.clicked.connect(self.reset_all_filters)
         
         # Подключаем обработчик выбора строки в таблице
         self.SnifferTable.itemSelectionChanged.connect(self.on_row_selected)
@@ -90,7 +134,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # По умолчанию тянем все секции по ширине окна
         for i in range(self.SnifferTable.columnCount()):
             header.setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
-        self.SnifferTable.setWordWrap(False)
+        # Для колонки "Количество регистров/байт" (колонка 6) устанавливаем минимальную ширину для читаемости ошибок
+        header.setMinimumSectionSize(200)
+        # Устанавливаем отдельную минимальную ширину для колонки 6
+        header.resizeSection(6, max(200, header.sectionSize(6)))
+        # Включаем перенос текста для ячеек (особенно для сообщений об ошибках)
+        self.SnifferTable.setWordWrap(True)
+        # Включаем автоматическое изменение высоты строки для переноса текста
+        self.SnifferTable.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         
         # Настройка выделения строки
         self.SnifferTable.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -180,14 +231,274 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     def convert_stopbits(self, stop_bit_text):
         """Преобразует текст стоп-битов в значение"""
         stopbits_map = {
-            "0": serial.STOPBITS_ONE,
-            "1": serial.STOPBITS_ONE_POINT_FIVE,
+            "1": serial.STOPBITS_ONE,
             "2": serial.STOPBITS_TWO
         }
         return stopbits_map.get(stop_bit_text, serial.STOPBITS_ONE)
+    
+    def on_scan_clicked(self):
+        """Обработка нажатия кнопки сканирования сети"""
+        if self.scanning_active:
+            # Остановка сканирования
+            self.scanning_active = False
+            # Закрываем текущий тестовый порт, если он открыт
+            if self.current_test_port:
+                try:
+                    self.current_test_port.close()
+                except:
+                    pass
+                self.current_test_port = None
+            self.pushButton_scan.setText("Сканирование сети")
+            self.label_scan_status.setText("")
+            return
+        
+        # Проверяем наличие COM порта
+        com_port = self.comboBox_COM.currentText()
+        if not com_port:
+            QMessageBox.warning(self, "Ошибка", "Выберите COM-порт")
+            return
+        
+        # Если уже подключены - отключаемся
+        if self.is_connected:
+            self.on_connect_clicked()
+        
+        # Запускаем сканирование в отдельном потоке
+        self.scanning_active = True
+        self.scan_successful = False  # Сбрасываем флаг успешного сканирования
+        self.pushButton_scan.setText("Остановить сканирование")
+        # Показываем label статуса
+        self.label_scan_status.setVisible(True)
+        self.label_scan_status.setText("Начало сканирования...")
+        self.scan_thread = threading.Thread(
+            target=self.scan_network_parameters,
+            args=(com_port,),
+            daemon=True
+        )
+        self.scan_thread.start()
+    
+    def update_scan_status_label(self, text):
+        """Обновляет текст статуса сканирования (вызывается из сигнала)"""
+        self.label_scan_status.setText(text)
+        self.label_scan_status.setVisible(True)
+    
+    def update_scan_button(self, text):
+        """Обновляет текст кнопки сканирования (вызывается из сигнала)"""
+        self.pushButton_scan.setText(text)
+    
+    def on_scan_finished(self, success, baudrate, bytesize, parity, stopbit):
+        """Обработка завершения сканирования (вызывается из сигнала)"""
+        if success:
+            # Устанавливаем найденные параметры
+            found_index = -1
+            for i in range(self.comboBox_baudrate.count()):
+                if self.comboBox_baudrate.itemText(i) == baudrate:
+                    found_index = i
+                    break
+            if found_index >= 0:
+                self.comboBox_baudrate.setCurrentIndex(found_index)
+            else:
+                self.comboBox_baudrate.addItem(baudrate)
+                self.comboBox_baudrate.setCurrentText(baudrate)
+            
+            self.comboBox_date_bit.setCurrentText(bytesize)
+            self.comboBox_parity.setCurrentText(parity)
+            self.comboBox_stop_bit.setCurrentText(stopbit)
+            
+            # Устанавливаем флаг успешного сканирования
+            self.scan_successful = True
+            # Автоматически подключаемся через 500 мс
+            QTimer.singleShot(500, self.on_connect_clicked)
+        else:
+            # Сканирование не удалось
+            self.scanning_active = False
+            self.pushButton_scan.setText("Сканирование сети")
+            self.label_scan_status.setText("")
+            QMessageBox.warning(self, "Сканирование", "Не обнаружен обмен")
+    
+    def format_parity_short(self, parity_text):
+        """Преобразует текст четности в короткий формат"""
+        parity_map = {
+            "Нет": "N",
+            "Четный": "E",
+            "Нечетный": "O"
+        }
+        return parity_map.get(parity_text, "N")
+    
+    def update_scan_status(self, baudrate, bytesize, parity_text, stop_bit_text):
+        """Обновляет статус сканирования в UI через сигнал"""
+        parity_short = self.format_parity_short(parity_text)
+        status_text = f"Подключение {baudrate}-{bytesize}-{parity_short}-{stop_bit_text}"
+        # Используем сигнал для безопасного обновления из потока
+        self.scan_signals.status_update.emit(status_text)
+    
+    def scan_network_parameters(self, com_port):
+        """Сканирует параметры сети для указанного COM порта"""
+        # Все возможные комбинации параметров
+        # Используем стандартные скорости Modbus
+        baudrates = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
+        bytesizes = [7, 8]
+        parities = ["Нет", "Четный", "Нечетный"]
+        stopbits_list = ["1", "2"]
+        
+        # Перебираем все комбинации, начиная со скорости
+        for baudrate in baudrates:
+            if not self.scanning_active:
+                break
+            
+            for bytesize in bytesizes:
+                if not self.scanning_active:
+                    break
+                
+                for parity_text in parities:
+                    if not self.scanning_active:
+                        break
+                    
+                    for stop_bit_text in stopbits_list:
+                        if not self.scanning_active:
+                            break
+                        
+                        # Преобразуем параметры
+                        parity = self.convert_parity(parity_text)
+                        stopbits = self.convert_stopbits(stop_bit_text)
+                        
+                        # Обновляем статус сканирования через сигнал
+                        self.update_scan_status(baudrate, bytesize, parity_text, stop_bit_text)
+                        # Небольшая пауза для обработки события обновления UI
+                        import time
+                        time.sleep(0.05)
+                        
+                        # Пытаемся подключиться с этими параметрами
+                        test_port = None
+                        try:
+                            test_port = serial.Serial(
+                                port=com_port,
+                                baudrate=baudrate,
+                                bytesize=bytesize,
+                                parity=parity,
+                                stopbits=stopbits,
+                                timeout=2.0  # Таймаут для чтения
+                            )
+                            
+                            # Сохраняем ссылку на порт для возможности закрытия при остановке
+                            self.current_test_port = test_port
+                            
+                            # Очищаем буфер порта
+                            test_port.reset_input_buffer()
+                            
+                            # Читаем сообщения в течение 2 секунд
+                            valid_messages_count = 0
+                            total_messages_count = 0
+                            start_time = datetime.now()
+                            test_queue = queue.Queue()
+                            
+                            # Запускаем поток чтения
+                            test_read_thread = threading.Thread(
+                                target=read_from_com,
+                                args=(test_port, test_queue),
+                                daemon=True
+                            )
+                            test_read_thread.start()
+                            
+                            # Проверяем сообщения в течение 2 секунд
+                            while (datetime.now() - start_time).total_seconds() < 2.0:
+                                if not self.scanning_active:
+                                    break
+                                
+                                try:
+                                    message_hex = test_queue.get(timeout=0.1)
+                                    message_bytes = bytes.fromhex(message_hex)
+                                    if len(message_bytes) >= 4:
+                                        total_messages_count += 1
+                                        frame = Frame(message_bytes)
+                                        if frame.CRC_ok:
+                                            valid_messages_count += 1
+                                except queue.Empty:
+                                    continue
+                                except Exception:
+                                    pass
+                            
+                            # После завершения 2 секунд проверяем процент валидных сообщений
+                            if total_messages_count > 0:
+                                valid_percentage = (valid_messages_count / total_messages_count) * 100
+                                # Если процент валидных сообщений >= 80% - параметры найдены
+                                if valid_percentage >= 80.0:
+                                    # Закрываем тестовый порт (поток чтения закроется автоматически)
+                                    try:
+                                        test_port.close()
+                                    except:
+                                        pass
+                                    self.current_test_port = None
+                                    
+                                    # Останавливаем сканирование
+                                    self.scanning_active = False
+                                    
+                                    # Отправляем сигналы о успешном завершении с найденными параметрами
+                                    self.scan_signals.status_update.emit("Параметры найдены!")
+                                    self.scan_signals.button_update.emit("Сканирование сети")
+                                    self.scan_signals.scan_finished.emit(
+                                        True,  # success
+                                        str(baudrate),
+                                        str(bytesize),
+                                        parity_text,
+                                        stop_bit_text
+                                    )
+                                    
+                                    return
+                            
+                            # Закрываем тестовый порт (поток чтения закроется автоматически)
+                            try:
+                                test_port.close()
+                            except:
+                                pass
+                            self.current_test_port = None
+                            
+                        except Exception:
+                            # Ошибка подключения с этими параметрами - пробуем следующие
+                            if test_port:
+                                try:
+                                    test_port.close()
+                                except:
+                                    pass
+                            self.current_test_port = None
+                            continue
+        
+        # Если дошли сюда - правильные параметры не найдены
+        if self.scanning_active:
+            self.scanning_active = False
+            # Отправляем сигнал о неудачном завершении
+            self.scan_signals.status_update.emit("")
+            self.scan_signals.button_update.emit("Сканирование сети")
+            self.scan_signals.scan_finished.emit(False, "", "", "", "")
 
     def on_connect_clicked(self):
         """Обработка нажатия кнопки подключения"""
+        # Если это автоматическое подключение после сканирования, проверяем флаг
+        if hasattr(self, 'scan_successful') and self.scan_successful:
+            # Сбрасываем флаг после использования
+            self.scan_successful = False
+        
+        # Закрываем тестовый порт сканирования, если он открыт
+        if self.current_test_port:
+            try:
+                if self.current_test_port.is_open:
+                    self.current_test_port.close()
+            except:
+                pass
+            self.current_test_port = None
+        
+        # Закрываем существующий порт, если он открыт
+        if self.serial_port:
+            try:
+                if self.serial_port.is_open:
+                    self.serial_port.close()
+            except:
+                pass
+            self.serial_port = None
+        
+        # Небольшая задержка для освобождения порта системой
+        import time
+        time.sleep(0.2)
+        
         if not self.is_connected:
             # Подключение
             try:
@@ -215,7 +526,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 parity = self.convert_parity(parity_text)
                 stopbits = self.convert_stopbits(stop_bit_text)
                 
-                # Открываем COM-порт
+                # Проверяем, что все параметры получены корректно
+                if not com_port or not baud_rate or not bytesize or parity is None or stopbits is None:
+                    error_msg = f"Не все параметры подключения заданы корректно:\nCOM: {com_port}\nСкорость: {baud_rate}\nБиты: {bytesize}\nЧетность: {parity}\nСтоп-бит: {stopbits}"
+                    QMessageBox.warning(self, "Ошибка", error_msg)
+                    return
+                
+                # Открываем COM-порт с параметрами из выпадающих списков
                 self.serial_port = serial.Serial(
                     port=com_port,
                     baudrate=baud_rate,
@@ -225,7 +542,24 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                     timeout=None
                 )
                 
-                # Запускаем поток для чтения
+                # Проверяем, что параметры применились корректно
+                if (self.serial_port.baudrate != baud_rate or 
+                    self.serial_port.bytesize != bytesize or 
+                    self.serial_port.parity != parity or 
+                    self.serial_port.stopbits != stopbits):
+                    warning_msg = (f"Параметры порта установлены некорректно.\n"
+                                 f"Ожидалось: {baud_rate}, {bytesize}, {parity}, {stopbits}\n"
+                                 f"Установлено: {self.serial_port.baudrate}, {self.serial_port.bytesize}, "
+                                 f"{self.serial_port.parity}, {self.serial_port.stopbits}")
+                    QMessageBox.warning(self, "Предупреждение", warning_msg)
+                
+                # Очищаем буфер порта после открытия
+                self.serial_port.reset_input_buffer()
+                self.serial_port.reset_output_buffer()
+                
+                self.is_connected = True
+                
+                # Запускаем поток для чтения из COM порта
                 self.read_thread = threading.Thread(
                     target=read_from_com,
                     args=(self.serial_port, self.message_queue),
@@ -233,7 +567,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 )
                 self.read_thread.start()
                 
-                self.is_connected = True
+                # Запускаем поток для декодирования сообщений
+                self.decode_thread = threading.Thread(
+                    target=self.decode_messages,
+                    daemon=True
+                )
+                self.decode_thread.start()
                 self.connected_at = datetime.now()
                 self.skip_first_invalid_crc = True
                 # Сбрасываем флаг ожидания первого запроса при новом подключении
@@ -255,55 +594,111 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 if self.serial_port:
                     self.serial_port.close()
                     self.serial_port = None
+                # Ждем завершения потоков
+                if self.decode_thread and self.decode_thread.is_alive():
+                    # Поток завершится сам, так как serial_port закрыт
+                    pass
                 self.is_connected = False
                 self.pushButton_connect.setText("Подключение")
                 QMessageBox.information(self, "Информация", "Отключено от COM-порта")
             except Exception as e:
                 QMessageBox.warning(self, "Ошибка отключения", str(e))
 
-    def process_messages(self):
-        """Обрабатывает сообщения из очереди и добавляет в таблицу"""
-        try:
-            while not self.message_queue.empty():
-                message_hex = self.message_queue.get_nowait()
-                # Преобразуем hex строку в bytes
+    def decode_messages(self):
+        """Декодирует сообщения из очереди в отдельном потоке"""
+        while True:
+            try:
+                # Проверяем, подключены ли мы
+                if not self.is_connected:
+                    import time
+                    time.sleep(0.1)
+                    continue
+                
+                # Получаем сообщение из очереди с таймаутом
+                message_hex = self.message_queue.get(timeout=0.1)
                 try:
                     message_bytes = bytes.fromhex(message_hex)
                     if len(message_bytes) >= 4:  # Минимум адрес + функция + CRC (2 байта)
-                        # Создаем объект Frame
+                        # Создаем объект Frame (декодирование в отдельном потоке)
                         frame = Frame(message_bytes)
+                        
                         # Фильтр некорректных CRC в течение 1 секунды после подключения
                         if self.connected_at is not None:
-                            if (datetime.now() - self.connected_at).total_seconds() < 1.0 and not frame.CRC_ok:
+                            time_since_connect = (datetime.now() - self.connected_at).total_seconds()
+                            if time_since_connect < 1.0 and not frame.CRC_ok:
                                 continue
                             # После 1 секунды отключаем этот фильтр
-                            if (datetime.now() - self.connected_at).total_seconds() >= 1.0:
+                            if time_since_connect >= 1.0:
                                 self.connected_at = None
+                        
                         # Старый одноразовый фильтр (на случай очень раннего пакета)
-                        if self.skip_first_invalid_crc and not frame.CRC_ok:
-                            self.skip_first_invalid_crc = False
-                            continue
                         if self.skip_first_invalid_crc:
+                            if not frame.CRC_ok:
+                                self.skip_first_invalid_crc = False
+                                continue
                             self.skip_first_invalid_crc = False
                         
-                        # Проверяем, нужно ли ждать первого запроса
-                        row_data = frame.get_list()
-                        message_type_value = str(row_data[2]) if len(row_data) > 2 else None
-                        
-                        if self.waiting_for_first_request:
-                            # Если это ответ - отбрасываем его
-                            if message_type_value == "Ответ":
-                                continue
-                            # Если это запрос с хорошей CRC - начинаем выводить
-                            if message_type_value == "Запрос" and frame.CRC_ok:
-                                self.waiting_for_first_request = False
-                        
-                        # Добавляем/обновляем строку
-                        self.add_or_update_row(frame, message_bytes)
-                        self.last_message_time = datetime.now()
-                except Exception as e:
-                    print(f"Ошибка обработки сообщения: {e}")
+                        # Кладим декодированное сообщение в очередь для обработки в GUI потоке
+                        try:
+                            self.decoded_queue.put_nowait((frame, message_bytes))  # Неблокирующая вставка
+                        except queue.Full:
+                            # Если очередь переполнена - пропускаем сообщение (GUI поток слишком медленный)
+                            pass
+                except Exception:
+                    # Ошибка декодирования - пропускаем
+                    pass
+            except queue.Empty:
+                continue
+            except Exception:
+                # Порт закрыт или другая ошибка - выходим из цикла
+                break
+    
+    def process_decoded_messages(self):
+        """Обрабатывает декодированные сообщения из очереди и добавляет в таблицу"""
+        # Обрабатываем батчами для оптимизации (максимум 20 сообщений за раз)
+        max_batch_size = 20
+        processed_count = 0
+        
+        try:
+            while processed_count < max_batch_size:
+                try:
+                    # Используем get_nowait для неблокирующего получения
+                    frame, message_bytes = self.decoded_queue.get_nowait()
+                    processed_count += 1
+                except queue.Empty:
+                    break
+                
+                # Проверяем, нужно ли ждать первого запроса
+                # Оптимизация: определяем тип сообщения без полного get_list() где возможно
+                base_function = frame.function & 0x7F
+                
+                # Быстрое определение типа для функций чтения (1-4)
+                if base_function in (0x01, 0x02, 0x03, 0x04):
+                    # Для функций чтения: если data[0] == длина данных-1 - это ответ
+                    if len(frame.data) > 1 and frame.data[0] == len(frame.data) - 1:
+                        message_type_value = "Ответ"
+                    else:
+                        message_type_value = "Запрос"
+                else:
+                    # Для остальных функций используем полный get_list (нужно для функций 5,6,15,16)
+                    row_data = frame.get_list()
+                    message_type_value = str(row_data[2]) if len(row_data) > 2 else "Запрос"
+                
+                if self.waiting_for_first_request:
+                    # Если это ответ - отбрасываем его
+                    if message_type_value == "Ответ":
+                        continue
+                    # Если это запрос с хорошей CRC - начинаем выводить
+                    if message_type_value == "Запрос" and frame.CRC_ok:
+                        self.waiting_for_first_request = False
+                
+                # Добавляем/обновляем строку
+                self.add_or_update_row(frame, message_bytes)
+                self.last_message_time = datetime.now()
         except queue.Empty:
+            pass
+        except Exception:
+            # Ошибка обработки - пропускаем
             pass
 
     def add_or_update_row(self, frame: Frame, message_bytes: bytes):
@@ -315,10 +710,45 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # Ключи для поиска существующих строк
         base_function = frame.function & 0x7F  # для исключений (MSB=1) ищем по базовой функции
         is_exception = (frame.function & 0x80) != 0
+        
+        # Кэшируем hex для оптимизации (используется несколько раз)
+        message_hex = message_bytes.hex()
+        
+        # Для функций 5 и 6 нужно проверить, является ли это ответом
+        # Определяем по наличию соответствующего запроса или по порядку поступления
+        # Важно: изменяем тип только для функций 5 и 6, для остальных используем тип из decode.py
+        if base_function in (0x05, 0x06) and len(frame.data) == 4:
+            # Создаем ключ для отслеживания одинаковых сообщений
+            write_key = (frame.address, base_function, frame.data)
+            
+            # Проверяем, есть ли запрос с такими же данными (эхо запроса)
+            if message_hex in self.request_index_by_bytes:
+                # Это ответ на ранее полученный запрос
+                message_type_value = "Ответ"
+                row_data[2] = "Ответ"
+            else:
+                # Проверяем, сколько раз уже приходило такое же сообщение
+                if write_key not in self.write_single_message_count:
+                    self.write_single_message_count[write_key] = 0
+                self.write_single_message_count[write_key] += 1
+                
+                # Если это второе одинаковое сообщение - первое было запросом, это ответ
+                if self.write_single_message_count[write_key] == 2:
+                    message_type_value = "Ответ"
+                    row_data[2] = "Ответ"
+                    # Для функции 6: когда приходит второе сообщение, нужно обновить счетчик запроса
+                    # Запрос уже должен быть в request_index_by_bytes, так как сообщения обрабатываются последовательно
+                    # Но если его там нет - значит это первое сообщение еще не было обработано
+                    # В этом случае просто обрабатываем как ответ, запрос будет обработан позже
+                # Для первого сообщения (счетчик == 1) оставляем тип "Запрос" из decode.py
+        
         if message_type_value == "Запрос":
             req_key = message_bytes.hex()
             # Запоминаем время последнего запроса по адресу и функции
             self.last_request_time_by_af[(frame.address, base_function)] = now
+            # Для функций 5 и 6 также запоминаем время по конкретному запросу
+            if base_function in (0x05, 0x06) and len(frame.data) == 4:
+                self.last_request_time_by_key[req_key] = now
             # Если такой запрос уже есть — обновляем время и счетчик
             if req_key in self.request_index_by_bytes:
                 row_position = self.request_index_by_bytes[req_key]
@@ -333,27 +763,58 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 counter_item.setBackground(QColor(215, 228, 242))
                 self.SnifferTable.setItem(row_position, 1, time_item)
                 self.SnifferTable.setItem(row_position, 0, counter_item)
+                # Фильтры применяются только при изменении пользователем, не при каждом обновлении
                 return
             pending_req_key = req_key
-        else:
+        elif message_type_value == "Ответ":
             # Подпись ответа: все поля кроме Счетчика, Времени и Данных (по колонкам)
-            crc_hex = ' '.join(f'{b:02x}' for b in row_data[8]) if isinstance(row_data[8], bytes) else str(row_data[8])
+            crc_hex = ' '.join(f'{b:02x}' for b in row_data[9]) if isinstance(row_data[9], bytes) else str(row_data[9])
             signature_tuple = (
                 row_data[2],  # Тип сообщения
                 row_data[3],  # Адрес
                 row_data[4],  # Функция
                 row_data[5],  # Адрес первого регистра / '-'
                 row_data[6],  # Кол-во регистров/байт
+                row_data[7],  # Количество байт далее (для функций 15, 16)
                 crc_hex,      # CRC как строка
-                row_data[9],  # CRC_OK
+                row_data[10],  # CRC_OK
             )
             resp_key = str(signature_tuple)
-            # Время ответа: +мс от последнего запроса по (адрес, функция)
+            
+            # Для функций 5 и 6: время ответа отсчитывается от последнего запроса с такими же данными
+            # Для остальных функций: время от последнего запроса по (адрес, функция)
             delta_ms = None
-            if (frame.address, base_function) in self.last_request_time_by_af:
-                delta = now - self.last_request_time_by_af[(frame.address, base_function)]
-                delta_ms = int(delta.total_seconds() * 1000)
+            if base_function in (0x05, 0x06) and len(frame.data) == 4:
+                # Для функций 5 и 6 ищем время последнего запроса с такими же данными
+                if message_hex in self.last_request_time_by_key:
+                    # Используем время конкретного запроса (последнего с такими же данными)
+                    delta = now - self.last_request_time_by_key[message_hex]
+                    delta_ms = int(delta.total_seconds() * 1000)
+                elif (frame.address, base_function) in self.last_request_time_by_af:
+                    # Если нет времени для конкретного запроса, используем общее время по адресу и функции
+                    delta = now - self.last_request_time_by_af[(frame.address, base_function)]
+                    delta_ms = int(delta.total_seconds() * 1000)
+            else:
+                # Для остальных функций используем стандартную логику
+                if (frame.address, base_function) in self.last_request_time_by_af:
+                    delta = now - self.last_request_time_by_af[(frame.address, base_function)]
+                    delta_ms = int(delta.total_seconds() * 1000)
+            
             time_display = f"+{delta_ms} ms" if delta_ms is not None else now.strftime("%H:%M:%S.%f")[:-3]
+
+            # Для функций 5 и 6: при получении ответа увеличиваем счетчик соответствующего запроса
+            if base_function in (0x05, 0x06) and len(frame.data) == 4:
+                if message_hex in self.request_index_by_bytes:
+                    # Запрос найден - увеличиваем его счетчик
+                    req_row_pos = self.request_index_by_bytes[message_hex]
+                    if message_hex not in self.message_counters:
+                        self.message_counters[message_hex] = 0
+                    self.message_counters[message_hex] += 1
+                    # Обновляем счетчик запроса в таблице (оптимизация: проверяем видимость строки)
+                    if not self.SnifferTable.isRowHidden(req_row_pos):
+                        counter_item = QTableWidgetItem(str(self.message_counters[message_hex]))
+                        counter_item.setBackground(QColor(215, 228, 242))
+                        self.SnifferTable.setItem(req_row_pos, 0, counter_item)
 
             if resp_key in self.response_index_by_signature:
                 row_position = self.response_index_by_signature[resp_key]
@@ -362,7 +823,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                     self.message_counters[resp_key] = 0
                 self.message_counters[resp_key] += 1
                 # Обновляем данные, время и счетчик
-                data_value = row_data[7]
+                data_value = row_data[8]  # Данные теперь в колонке 8
                 if isinstance(data_value, bytes):
                     data_text = ' '.join(f'{byte:02x}' for byte in data_value) if data_value else '-'
                 else:
@@ -378,9 +839,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 time_item.setBackground(bg_color)
                 counter_item = QTableWidgetItem(str(self.message_counters[resp_key]))
                 counter_item.setBackground(bg_color)
-                self.SnifferTable.setItem(row_position, 7, data_item)
+                self.SnifferTable.setItem(row_position, 8, data_item)  # Данные теперь в колонке 8
                 self.SnifferTable.setItem(row_position, 1, time_item)
                 self.SnifferTable.setItem(row_position, 0, counter_item)
+                
+                # Фильтры применяются только при изменении пользователем, не при каждом обновлении
                 
                 # Обновляем сохраненные данные сообщения
                 try:
@@ -401,14 +864,28 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # Сохраняем данные сообщения для окна "Значения" перед добавлением строки
         data_bytes = None
         if message_type_value == "Ответ":
-            # Для ответов payload начинается после байта количества
-            if isinstance(frame.data, bytes) and len(frame.data) > 1:
+            # Для ответов функций чтения данные начинаются после байта количества
+            if base_function in (0x01, 0x02, 0x03, 0x04) and len(frame.data) > 1:
                 data_bytes = frame.data[1:]  # пропускаем байт количества
-        elif message_type_value == "Запрос":
-            # Для запросов данные могут быть после первых 4 байт
-            if isinstance(frame.data, bytes) and len(frame.data) > 4:
+            elif base_function in (0x05, 0x06):
+                # Для функций 5 и 6 ответ содержит значение (2 байта после адреса)
+                if len(frame.data) >= 4:
+                    data_bytes = frame.data[2:4]  # значение (2 байта)
+            else:
+                data_bytes = frame.data
+        else:
+            # Для запросов функций чтения данные начинаются после первых 4 байт
+            if base_function in (0x01, 0x02, 0x03, 0x04) and len(frame.data) > 4:
                 data_bytes = frame.data[4:]
-            elif isinstance(frame.data, bytes):
+            elif base_function in (0x05, 0x06):
+                # Для функций 5 и 6 запрос содержит значение (2 байта после адреса)
+                if len(frame.data) >= 4:
+                    data_bytes = frame.data[2:4]  # значение (2 байта)
+            elif base_function in (0x0F, 0x10):
+                # Для функций 15 и 16 данные начинаются после адреса (2) + количества (2) + байта количества (1)
+                if len(frame.data) > 5:
+                    data_bytes = frame.data[5:]  # значения после байта количества
+            else:
                 data_bytes = frame.data
 
         # Если не обновляли — добавляем новую строку
@@ -572,7 +1049,44 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             item = QTableWidgetItem(data)  # Создаем новый элемент для ячейки
             if row_color is not None:
                 item.setBackground(row_color)
+            # Включаем перенос текста для колонки "Количество регистров/байт" (колонка 6) для сообщений об ошибках
+            if column == 6:
+                item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                # Убеждаемся, что перенос текста включен для этой ячейки
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEnabled)
             self.SnifferTable.setItem(row_position, column, item)  # Устанавливаем элемент в таблицу
+            # После добавления всех ячеек в строке обновляем высоту строки, если в колонке 6 длинный текст
+            if column == len(row_data) - 1:  # Последняя колонка в строке
+                col6_item = self.SnifferTable.item(row_position, 6)
+                if col6_item:
+                    col6_text = col6_item.text()
+                    # Проверяем, содержит ли текст "Ошибка:" или длиннее 15 символов
+                    if "Ошибка:" in col6_text or len(col6_text) > 15:
+                        # Принудительно обновляем высоту строки для переноса текста
+                        self.SnifferTable.resizeRowToContents(row_position)
+
+        # Обновляем списки фильтров (адрес и функция)
+        # Колонка 3 - адрес, колонка 4 - функция
+        if len(row_data) > 3:
+            try:
+                address_str = str(row_data[3])
+                # Проверяем, есть ли уже такой адрес в списке
+                if address_str and self.comboBox_filter_address.findText(address_str) == -1:
+                    self.comboBox_filter_address.addItem(address_str)
+            except Exception:
+                pass
+        
+        if len(row_data) > 4:
+            try:
+                func_val = int(row_data[4])
+                # Для ошибок берем базовую функцию (без MSB)
+                base_func = func_val & 0x7F
+                func_str = str(base_func)
+                # Проверяем, есть ли уже такая функция в списке
+                if func_str and self.comboBox_filter_function.findText(func_str) == -1:
+                    self.comboBox_filter_function.addItem(func_str)
+            except Exception:
+                pass
 
         # Сохраняем данные сообщения для окна "Значения"
         if data_bytes is not None and frame is not None:
@@ -626,15 +1140,16 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                             new_row_index = self.add_row_to_table(pending_row_data_local, pending_message_type)
                             # Сохраняем индекс для последующих обновлений
                             try:
-                                pending_crc_hex = ' '.join(f'{b:02x}' for b in pending_row_data_local[8]) if isinstance(pending_row_data_local[8], bytes) else str(pending_row_data_local[8])
+                                pending_crc_hex = ' '.join(f'{b:02x}' for b in pending_row_data_local[9]) if isinstance(pending_row_data_local[9], bytes) else str(pending_row_data_local[9])
                                 pending_signature = (
                                     pending_row_data_local[2],  # Тип сообщения
                                     pending_row_data_local[3],  # Адрес
                                     pending_row_data_local[4],  # Функция
                                     pending_row_data_local[5],  # Адрес первого регистра / '-'
                                     pending_row_data_local[6],  # Кол-во регистров/байт
+                                    pending_row_data_local[7],  # Количество байт далее (для функций 15, 16)
                                     pending_crc_hex,
-                                    pending_row_data_local[9],  # CRC_OK
+                                    pending_row_data_local[10],  # CRC_OK
                                 )
                                 pending_resp_key = str(pending_signature)
                                 self.response_index_by_signature[pending_resp_key] = new_row_index
@@ -650,9 +1165,28 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         filter_crc_ok = self.checkBox_filter_crc_ok.isChecked()
         filter_errors_only = self.checkBox_filter_errors_only.isChecked()
         
+        # Получаем значения фильтров адреса и функции
+        filter_address_text = self.comboBox_filter_address.currentText().strip()
+        filter_function_text = self.comboBox_filter_function.currentText().strip()
+        
+        # Парсим значения фильтров (если пусто - фильтр не применяется)
+        filter_address = None
+        if filter_address_text:
+            try:
+                filter_address = int(filter_address_text)
+            except ValueError:
+                filter_address = None
+        
+        filter_function = None
+        if filter_function_text:
+            try:
+                filter_function = int(filter_function_text)
+            except ValueError:
+                filter_function = None
+        
         for row in range(self.SnifferTable.rowCount()):
-            # Проверяем CRC_OK (колонка 9)
-            crc_ok_item = self.SnifferTable.item(row, 9)
+            # Проверяем CRC_OK (колонка 10)
+            crc_ok_item = self.SnifferTable.item(row, 10)
             crc_ok_value = False
             if crc_ok_item:
                 try:
@@ -664,12 +1198,22 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             # Проверяем, является ли сообщение ошибкой (колонка 4 - Функция)
             is_error = False
             func_item = self.SnifferTable.item(row, 4)
+            func_val = None
             if func_item:
                 try:
                     func_val = int(func_item.text())
                     is_error = (func_val & 0x80) != 0
                 except Exception:
                     is_error = False
+            
+            # Проверяем адрес (колонка 3)
+            address_val = None
+            address_item = self.SnifferTable.item(row, 3)
+            if address_item:
+                try:
+                    address_val = int(address_item.text())
+                except Exception:
+                    address_val = None
             
             # Определяем, должна ли строка быть видимой
             should_show = True
@@ -682,13 +1226,44 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             if filter_errors_only and not is_error:
                 should_show = False
             
+            # Фильтр по адресу
+            if filter_address is not None and address_val is not None:
+                if address_val != filter_address:
+                    should_show = False
+            
+            # Фильтр по функции (с учетом ошибок - для ошибок проверяем базовую функцию)
+            if filter_function is not None and func_val is not None:
+                # Для ошибок берем базовую функцию (без MSB)
+                base_func_val = func_val & 0x7F
+                if base_func_val != filter_function:
+                    should_show = False
+            
             # Применяем видимость
             self.SnifferTable.setRowHidden(row, not should_show)
 
+    def reset_all_filters(self):
+        """Сбрасывает все фильтры к значениям по умолчанию"""
+        # Сбрасываем чекбоксы
+        self.checkBox_filter_crc_ok.setChecked(False)
+        self.checkBox_filter_errors_only.setChecked(False)
+        
+        # Очищаем выпадающие списки (оставляем только пустой элемент)
+        self.comboBox_filter_address.setCurrentText("")
+        self.comboBox_filter_function.setCurrentText("")
+        
+        # Применяем фильтры (чтобы показать все строки)
+        self.apply_filters()
+    
     def clear_table(self):
         """Очищает таблицу Сниффер полностью и сбрасывает все счетчики и индексы"""
         # Очищаем таблицу
         self.SnifferTable.setRowCount(0)
+        
+        # Очищаем списки фильтров (оставляем только пустой элемент)
+        self.comboBox_filter_address.clear()
+        self.comboBox_filter_address.addItem("")
+        self.comboBox_filter_function.clear()
+        self.comboBox_filter_function.addItem("")
         
         # Очищаем все словари и индексы
         self.request_index_by_bytes.clear()
@@ -723,8 +1298,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # Берем первую выбранную строку
         row_position = selected_rows[0].row()
         
-        # Проверяем наличие данных в столбце "Данные" (колонка 7)
-        data_item = self.SnifferTable.item(row_position, 7)
+        # Проверяем наличие данных в столбце "Данные" (колонка 8)
+        data_item = self.SnifferTable.item(row_position, 8)  # Данные теперь в колонке 8
         if not data_item:
             # Если ячейка не существует, показываем прочерк
             self.ValuesTable.setRowCount(1)
@@ -755,7 +1330,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if row_position in self.message_data_storage:
             data_bytes, frame = self.message_data_storage[row_position]
         else:
-            # Пытаемся получить данные из ячейки таблицы "Данные" (колонка 7)
+            # Пытаемся получить данные из ячейки таблицы "Данные" (колонка 8)
             try:
                 # Парсим hex строку вида "aa bb cc dd"
                 hex_bytes = data_text.replace(' ', '')
@@ -818,10 +1393,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         
         for reg_idx in range(num_registers):
             # Колонка 0: номер регистра
+            reg_item = QTableWidgetItem(f"Регистр {reg_idx}")
             if reg_idx in reserved_registers:
-                reg_item = QTableWidgetItem(f"Регистр {reg_idx} (зарезервирован)")
-            else:
-                reg_item = QTableWidgetItem(f"Регистр {reg_idx}")
+                # Устанавливаем серый цвет для зарезервированных регистров
+                gray_color = QColor(220, 220, 220)  # Светло-серый цвет
+                reg_item.setBackground(gray_color)
             reg_item.setFlags(reg_item.flags() | Qt.ItemFlag.ItemIsEnabled)
             self.ValuesTable.setItem(reg_idx, 0, reg_item)
             
@@ -840,6 +1416,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             if reg_idx in reserved_registers:
                 type_combo.setEnabled(False)
                 reg_item.setFlags(reg_item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+                # Устанавливаем серый цвет для комбобокса (через стиль)
+                type_combo.setStyleSheet("background-color: rgb(220, 220, 220);")
             else:
                 # Подключаем обработчик изменения типа
                 type_combo.currentTextChanged.connect(lambda text, r=reg_idx, rp=row_position: self.on_register_type_changed(rp, r, text))
@@ -848,6 +1426,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             
             # Колонка 2: значение (будет заполнено после выбора типа)
             value_item = QTableWidgetItem("")
+            if reg_idx in reserved_registers:
+                # Устанавливаем серый цвет для зарезервированных регистров
+                gray_color = QColor(220, 220, 220)
+                value_item.setBackground(gray_color)
             self.ValuesTable.setItem(reg_idx, 2, value_item)
         
         # Обновляем значения для всех регистров
@@ -877,10 +1459,19 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                     next_combo = self.ValuesTable.cellWidget(reg_idx + 1, 1)
                     if next_combo:
                         next_combo.setEnabled(True)
-                    next_item = self.ValuesTable.item(reg_idx + 1, 0)
-                    if next_item:
-                        next_item.setText(f"Регистр {reg_idx + 1}")
-                        next_item.setFlags(next_item.flags() | Qt.ItemFlag.ItemIsEnabled)
+                next_item = self.ValuesTable.item(reg_idx + 1, 0)
+                if next_item:
+                    next_item.setText(f"Регистр {reg_idx + 1}")
+                    next_item.setFlags(next_item.flags() | Qt.ItemFlag.ItemIsEnabled)
+                    # Убираем серый цвет
+                    next_item.setBackground(QColor(255, 255, 255))
+                # Также обновляем цвет комбобокса и значения
+                next_combo = self.ValuesTable.cellWidget(reg_idx + 1, 1)
+                if next_combo:
+                    next_combo.setStyleSheet("")
+                next_value_item = self.ValuesTable.item(reg_idx + 1, 2)
+                if next_value_item:
+                    next_value_item.setBackground(QColor(255, 255, 255))
         
         # Если выбран 4-байтный тип, резервируем следующий регистр
         if new_type in ["float (ABCD)", "float (CDAB)", "float (BADC)", "float (DCBA)", "long (ABCD)", "long (CDAB)", "long (BADC)", "long (DCBA)"]:
@@ -891,8 +1482,16 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                     next_combo.setCurrentIndex(0)  # Сбрасываем на первый тип
                 next_item = self.ValuesTable.item(reg_idx + 1, 0)
                 if next_item:
-                    next_item.setText(f"Регистр {reg_idx + 1} (зарезервирован)")
+                    next_item.setText(f"Регистр {reg_idx + 1}")
                     next_item.setFlags(next_item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+                    # Устанавливаем серый цвет для зарезервированного регистра
+                    gray_color = QColor(220, 220, 220)
+                    next_item.setBackground(gray_color)
+                # Также устанавливаем серый цвет для комбобокса и значения
+                next_combo.setStyleSheet("background-color: rgb(220, 220, 220);")
+                next_value_item = self.ValuesTable.item(reg_idx + 1, 2)
+                if next_value_item:
+                    next_value_item.setBackground(gray_color)
         
         # Обновляем значения
         if row_position in self.message_data_storage:
@@ -912,10 +1511,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             if reg_idx > 0 and reg_idx - 1 < len(register_types):
                 prev_type = register_types[reg_idx - 1]
                 if prev_type in ["float (ABCD)", "float (CDAB)", "float (BADC)", "float (DCBA)", "long (ABCD)", "long (CDAB)", "long (BADC)", "long (DCBA)"]:
-                    # Этот регистр зарезервирован - показываем как часть предыдущего
+                    # Этот регистр зарезервирован - оставляем пустым
                     value_item = self.ValuesTable.item(reg_idx, 2)
                     if value_item:
-                        value_item.setText("(часть предыдущего регистра)")
+                        value_item.setText("")
+                        # Убеждаемся, что серый цвет сохранен
+                        gray_color = QColor(220, 220, 220)
+                        value_item.setBackground(gray_color)
                     continue
             
             if reg_idx >= len(register_types):

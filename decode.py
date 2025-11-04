@@ -66,55 +66,96 @@ class Frame:
         is_exception = (self.function & 0x80) != 0
         base_function = self.function & 0x7F  # базовая функция без флага исключения
 
-        # Определяем, является ли кадр ответом для функций чтения (0x01,0x02,0x03,0x04)
+        # Определяем тип функции
         is_read_function = base_function in (0x01, 0x02, 0x03, 0x04)
-        is_read_response = False
+        is_write_single = base_function in (0x05, 0x06)  # Write Single Coil/Register
+        is_write_multiple = base_function in (0x0F, 0x10)  # Write Multiple Coils/Registers (15, 16)
+
+        # Определяем, является ли кадр ответом
+        is_response = False
         # Если это исключение, это всегда ответ
         if is_exception:
-            is_read_response = True
-        elif len(self.data) >= 1 and is_read_function:
-            # В ответе первый байт после функции — количество байт данных
+            is_response = True
+        elif is_read_function and len(self.data) >= 1:
+            # Для функций чтения: в ответе первый байт после функции — количество байт данных
             byte_count = self.data[0]
-            is_read_response = (len(self.data) == 1 + byte_count)
+            is_response = (len(self.data) == 1 + byte_count)
+        elif is_write_single:
+            # Для функций 5 и 6: если длина данных = 4 байта, это может быть и запрос и ответ
+            # По умолчанию считаем запросом (ответ будет обработан отдельно при сопоставлении)
+            # Ответ для функций 5 и 6 - это эхо запроса (4 байта)
+            is_response = False  # Будет определяться в main.py при сопоставлении с запросом
+        elif is_write_multiple:
+            # Для функций 15 и 16:
+            # Запрос: длина данных > 5 байт (адрес 2 + количество 2 + байт количества 1 + значения)
+            # Ответ: длина данных = 4 байта (адрес 2 + количество 2)
+            if len(self.data) == 4:
+                is_response = True
+            else:
+                is_response = False
 
-        message_type = "Ответ" if is_read_response else "Запрос"
+        message_type = "Ответ" if is_response else "Запрос"
 
-        # Формируем колонки
-        # Адрес первого регистра (для запроса: 2 байта после функции; для ответа: '-')
-        if not is_read_response and len(self.data) >= 2 and not is_exception:
-            first_register_addr_value = int.from_bytes(self.data[0:2], byteorder="big")
-        else:
-            first_register_addr_value = None
+        # Инициализация переменных для колонок
+        first_register_addr_value = None
+        registers_count_display = "-"
+        byte_count_display = "-"  # Новый столбец "Количество байт далее"
+        payload = b""
 
-        # Количество регистров:
-        # - для запроса: 2 байта после адреса первого регистра (data[2:4])
-        # - для ответа: 1 байт (количество байт данных) = data[0]
-        # - для исключения: первый байт данных - код ошибки
+        # Обработка исключений
         if is_exception and len(self.data) >= 1:
             error_code = self.data[0]
             error_desc = self.get_error_description(error_code)
             registers_count_display = f"Ошибка: {error_desc}"
-        elif is_read_response and len(self.data) >= 1:
-            registers_count_value = int(self.data[0])
-            registers_count_display = registers_count_value
-        elif not is_read_response and len(self.data) >= 4:
-            registers_count_value = int.from_bytes(self.data[2:4], byteorder="big")
-            registers_count_display = registers_count_value
-        else:
-            registers_count_display = "-"
-
-        # Данные:
-        # - для запроса: остаток после первых 4 байт (если есть)
-        # - для ответа: данные после байта количества (если есть)
-        # - для исключения: остальные данные (обычно пусто, код ошибки уже в регистрах)
-        if is_exception:
             payload = self.data[1:] if len(self.data) > 1 else b""
-        elif is_read_response:
-            payload = self.data[1:]
-        else:
-            payload = self.data[4:] if len(self.data) > 4 else b""
+        
+        # Обработка функций чтения (0x01-0x04)
+        elif is_read_function:
+            if is_response and len(self.data) >= 1:
+                # Ответ: первый байт - количество байт данных
+                registers_count_value = int(self.data[0])
+                registers_count_display = registers_count_value
+                payload = self.data[1:]
+            elif not is_response and len(self.data) >= 4:
+                # Запрос: адрес регистра (2 байта) + количество (2 байта)
+                first_register_addr_value = int.from_bytes(self.data[0:2], byteorder="big")
+                registers_count_value = int.from_bytes(self.data[2:4], byteorder="big")
+                registers_count_display = registers_count_value
+                payload = self.data[4:] if len(self.data) > 4 else b""
+        
+        # Обработка функций записи одной единицы (5, 6)
+        elif is_write_single:
+            if len(self.data) >= 4:
+                # И запрос, и ответ имеют одинаковую структуру: адрес (2) + значение (2)
+                first_register_addr_value = int.from_bytes(self.data[0:2], byteorder="big")
+                if is_response:
+                    # Для ответа: количество регистров = 1 (эхо запроса)
+                    registers_count_display = 1
+                    # Данные ответа - это значение (2 байта)
+                    payload = self.data[2:4]
+                else:
+                    # Для запроса: количество регистров = 1
+                    registers_count_display = 1
+                    # Данные запроса - это значение (2 байта)
+                    payload = self.data[2:4]
+        
+        # Обработка функций записи множественных единиц (15, 16)
+        elif is_write_multiple:
+            if is_response and len(self.data) >= 4:
+                # Ответ: адрес (2) + количество (2)
+                first_register_addr_value = int.from_bytes(self.data[0:2], byteorder="big")
+                registers_count_value = int.from_bytes(self.data[2:4], byteorder="big")
+                registers_count_display = registers_count_value
+                payload = b""  # В ответе нет данных значений
+            elif not is_response and len(self.data) >= 5:
+                # Запрос: адрес (2) + количество (2) + байт количества (1) + значения
+                first_register_addr_value = int.from_bytes(self.data[0:2], byteorder="big")
+                registers_count_value = int.from_bytes(self.data[2:4], byteorder="big")
+                registers_count_display = registers_count_value
+                byte_count_display = int(self.data[4])  # Байт количества данных
+                payload = self.data[5:]  # Данные значений
 
-        # Для ответов и исключений поле "Адрес первого регистра" — прочерк
+        # Формируем итоговые значения для отображения
         first_register_addr_display = first_register_addr_value if first_register_addr_value is not None else "-"
         data_display = payload if payload else "-"
 
@@ -124,8 +165,9 @@ class Frame:
             message_type,                     # Тип сообщения
             self.address,                     # Адрес
             self.function,                    # Функция
-            first_register_addr_display if not is_read_response else "-",
+            first_register_addr_display,     # Адрес 1-го регистра
             registers_count_display,          # Кол-во регистров/байт
+            byte_count_display,               # Количество байт далее (только для 15, 16)
             data_display,                     # Данные
             self.received_crc,                # CRC
             self.CRC_ok                       # CRC_OK
